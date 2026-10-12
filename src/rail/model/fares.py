@@ -336,10 +336,11 @@ def _marker_reason_sql(column: str = "description") -> str:
 
 #: **`is_advance_fare` is a residual, and this is the class that is not.**
 #:
-#: A sellable ticket type is `is_walk_up` when none of five signals fires, and
-#: `is_advance_fare` when any of them does - so the second is really "sellable
-#: and tied to a booked train in some way", which is not the same thing as "an
-#: Advance ticket". The gap is what these markers name.
+#: A sellable ticket type is `is_walk_up` when none of five signals fires (or
+#: the structural rule overrules them - see `signalled` in
+#: `build_fares_reference`), and `is_advance_fare` otherwise - so the second is
+#: really "sellable and tied to a booked train in some way", which is not the
+#: same thing as "an Advance ticket". The gap is what these markers name.
 #:
 #: The weakest of the five signals is the validity record's `out_description`,
 #: and validity code `11` is why this list exists: it is *described* "AS
@@ -897,62 +898,63 @@ def build_fares_reference(
                 from read_parquet('{validity}')
                 where current_date between start_date and end_date
             ) v on v.validity_code = s.validity_code and v.rn = 1
+        ),
+        -- Two judgements, named once so the three classes below cannot drift
+        -- apart.
+        --
+        -- `booked_train_signal`: any of five signs that a fare is tied to a
+        -- booked train. `not_tied_to_a_train`: the structural reading that
+        -- outvotes them. A fare needing no reservation, carrying no
+        -- booked-train restriction on any of its prices, and not calling
+        -- itself an Advance is not tied to a booked train - whatever its
+        -- validity record says. `reservation_required` and the restriction
+        -- are statements about the product; the validity's `out_description`
+        -- is one field on a code shared between products. Validity `11` is
+        -- described "AS ADVERTISED" and reads `BOOKDTRAINONLY`, which is how
+        -- `GTS ANYTIME S` - 205 fares, not one with a restriction - became
+        -- the cheapest "Advance" to Hartlepool and Thirsk.
+        --
+        -- The structural rule catches 25 types: the Grand Central Anytimes,
+        -- the promotional Off-Peaks, `DUMY-DO NOT USE`, and both transfer
+        -- fees at a flat £88-£102. **They are walk-up fares.** An earlier
+        -- version used the rule only to keep them out of `is_real_advance`,
+        -- leaving `is_walk_up` as it was - so they were in neither class and
+        -- were never offered at all. Eaglescliffe to King's Cross on Grand
+        -- Central's 07:29 was quoted as the GBP 199.00 any-operator Anytime
+        -- when `GTS` sells for GBP 123.90 on that train and every retailer
+        -- shows it. `DUMY-DO NOT USE` and the transfer fees are still out:
+        -- they fail `is_sellable` before any of this is asked.
+        signalled as (
+            select *,
+                   (is_advance or booked_train_only
+                    or every_fare_on_a_booked_train
+                    or needs_reservation
+                    or upper(description) like '%ADVANCE%')
+                       as booked_train_signal,
+                   (coalesce(reservation_required, '{NO_RESERVATION}')
+                        = '{NO_RESERVATION}'
+                    and not every_fare_on_a_booked_train
+                    and upper(description) not like '%ADV%')
+                       as not_tied_to_a_train
+            from booked_only
         )
         select * exclude (booked_train_only, every_fare_on_a_booked_train,
-                          needs_reservation),
+                          needs_reservation, booked_train_signal,
+                          not_tied_to_a_train),
                -- Advance prices are real and distance-varying; what the feed
                -- does not carry is whether a given price point is on sale for a
                -- given train, which lives in the reservation system.
-               is_sellable
-                   and (is_advance or booked_train_only
-                        or every_fare_on_a_booked_train
-                        or needs_reservation
-                        or upper(description) like '%ADVANCE%')
+               is_sellable and booked_train_signal and not not_tied_to_a_train
                    as is_advance_fare,
-               is_sellable
-                   and not (is_advance or booked_train_only
-                            or every_fare_on_a_booked_train
-                            or needs_reservation
-                            or upper(description) like '%ADVANCE%')
+               is_sellable and (not booked_train_signal or not_tied_to_a_train)
                    as is_walk_up,
                -- **The narrow class: an Advance somebody can actually buy.**
                --
-               -- `is_advance_fare` above is a *residual* - sellable and not a
-               -- walk-up - so anything the five signals catch lands in it,
-               -- including things that are not Advance tickets at all. Two
-               -- rules take those out, and nothing else moves: `is_walk_up` and
-               -- `is_advance_fare` are untouched, so every existing caller
-               -- answers exactly as it did.
-               --
-               -- **The structural rule, which does most of the work.** A fare
-               -- needing no reservation, carrying no booked-train restriction
-               -- on any of its prices, and not calling itself an Advance is not
-               -- tied to a booked train - whatever its validity record says.
-               -- That is the honest reading when the three signals disagree:
-               -- `reservation_required` and the restriction are statements
-               -- about the product, and the validity's `out_description` is one
-               -- field on a code shared between products. Validity `11` is
-               -- described "AS ADVERTISED" and reads `BOOKDTRAINONLY`, which is
-               -- how `GTS ANYTIME S` - 205 fares, not one with a restriction -
-               -- became the cheapest "Advance" to Hartlepool and Thirsk.
-               --
-               -- It catches 25 types: the Grand Central Anytimes, the
-               -- promotional Off-Peaks, `DUMY-DO NOT USE`, and both transfer
-               -- fees at a flat £88-£102.
-               --
-               -- The second rule is `PSEUDO_ADVANCE_MARKERS`, for a fare that
-               -- genuinely is tied to a booked train and still is not one the
-               -- public can buy - a retailer's own scheme, a rover, a swap.
-               is_sellable
-                   and (is_advance or booked_train_only
-                        or every_fare_on_a_booked_train
-                        or needs_reservation
-                        or upper(description) like '%ADVANCE%')
-                   and not (
-                       coalesce(reservation_required, '{NO_RESERVATION}')
-                           = '{NO_RESERVATION}'
-                       and not every_fare_on_a_booked_train
-                       and upper(description) not like '%ADV%')
+               -- `is_advance_fare` is sellable and tied to a booked train;
+               -- this takes out what `PSEUDO_ADVANCE_MARKERS` name - a fare
+               -- that genuinely is tied to a booked train and still is not one
+               -- the public can buy: a retailer's own scheme, a rover, a swap.
+               is_sellable and booked_train_signal and not not_tied_to_a_train
                    and not ({_pseudo_advance_sql()})
                    as is_real_advance,
                -- **Pay as you go, kept rather than discarded.** Excluded from
@@ -1027,7 +1029,7 @@ def build_fares_reference(
                    when upper(description) like '%PAYG%'
                      or upper(description) like '%OYSTER%' then 'oyster'
                end as payg_family
-        from booked_only
+        from signalled
     """)
     # `is_payg` is "a tap price rather than a ticket", so it spans both media
     # and excludes the top-up ladder and the not-yet-live set. A consumer that

@@ -3146,21 +3146,35 @@ def test_a_walk_up_on_a_booked_train_validity_is_not_a_real_advance(fares):
 
     The rule is that the other two signals outvote the validity: a fare needing
     no reservation, with no booked-train restriction on any of its prices, and
-    not calling itself an Advance is not tied to a booked train."""
+    not calling itself an Advance is not tied to a booked train.
+
+    And a fare not tied to a booked train is a walk-up. Keeping it only out of
+    the Advance class left `GTS` in neither, so it was never offered: Grand
+    Central's 07:29 from Eaglescliffe was quoted the GBP 199 any-operator
+    Anytime over the GBP 123.90 GTS every retailer sells for it."""
     connection, directory = fares(
         flows=[flow(1, "1111", "2222")],
-        fare_records=[fare(1, "GTS", 2080), fare(1, "NAA", 2560)],
+        fare_records=[fare(1, "GTS", 2080), fare(1, "NAA", 2560),
+                      fare(1, "SOS", 3200)],
         tickets=[ticket("GTS", "ANYTIME S", validity="11", reservation="N"),
-                 ticket("NAA", "ADVANCE", reservation="B")],
+                 ticket("NAA", "ADVANCE", reservation="B"),
+                 ticket("SOS", "ANYTIME S")],
         validities=[("11", False, {"description": "AS ADVERTISED",
                                    "out_description": "BOOKDTRAINONLY"})],
     )
-    kinds = dict(connection.execute(
-        "select ticket_code, is_real_advance from ticket_type_current").fetchall())
-    assert kinds == {"GTS": False, "NAA": True}
+    kinds = {code: (walk_up, advance, real) for code, walk_up, advance, real
+             in connection.execute(
+                 "select ticket_code, is_walk_up, is_advance_fare, is_real_advance"
+                 " from ticket_type_current").fetchall()}
+    assert kinds == {"GTS": (True, False, False),
+                     "NAA": (False, True, True),
+                     "SOS": (True, False, False)}
 
     priced = cheapest_from(connection, directory, "AAA", TRAVEL, advance_only=True)
     assert [(row[0], row[3]) for row in priced] == [("BBB", 2560)]
+    # The walk-up answer is GTS, not the dearer any-operator Anytime.
+    walk_up = cheapest_from(connection, directory, "AAA", TRAVEL)
+    assert [(row[0], row[1], row[3]) for row in walk_up] == [("BBB", "GTS", 2080)]
 
 
 def test_the_narrow_class_never_widens_the_broad_one(fares):
